@@ -1,0 +1,7 @@
+{
+  "GitHubOwner": "Fares-G96",
+  "GitHubRepo": "Fattura",
+  "CurrentVersion": "1.0.0",
+  "CheckForUpdatesOnStartup": true,
+  "NetworkTimeoutSeconds": 15
+}

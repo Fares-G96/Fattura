@@ -1,0 +1,203 @@
+name: Publish Release Assets
+
+# يعمل تلقائيًا عند نشر إصدار (Release) جديد على GitHub (وليس Draft).
+#
+# ملاحظة مهمة جدًا: هذا المستودع (Fattura) هو مستودع التوزيع فقط — يحتوي فقط على التطبيق
+# المنشور مسبقًا من Visual Studio (Fattura.exe + Runtime/...)، وليس فيه كود مصدري (.csproj/.sln)
+# على الإطلاق. لذلك هذا السير **لا يبني أي شيء بـ dotnet إطلاقًا** — فقط يأخذ ما هو موجود بالفعل
+# في آخر Commit مدفوع لهذا المستودع، ويولّد منه: manifest.json (SHA256 لكل ملف)، full.zip،
+# patch.zip (الملفات المتغيّرة فقط مقارنة بالإصدار السابق)، Changelog، وحزمة تنزيل كاملة جديدة.
+#
+# سير العمل المتوقَّع منك (يدويًا، خارج GitHub Actions):
+#   Visual Studio → Publish → انسخ الناتج يدويًا إلى هذا المستودع (Runtime + Fattura.exe)
+#   → git add/commit/push → Create Release بتاج جديد (مثل v1.2.0) → كل ما بعد ذلك تلقائي بالكامل.
+on:
+  release:
+    types: [published]
+
+  # يسمح أيضًا بتشغيله يدويًا من تبويب Actions لأغراض الاختبار دون إنشاء إصدار فعلي
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build assets for (e.g. v1.2.0) — must already exist"
+        required: true
+
+permissions:
+  contents: write # مطلوب لرفع الملفات كأصول (Assets) للإصدار ولتعديل ملاحظاته
+
+jobs:
+  publish-assets:
+    runs-on: ubuntu-latest # لا حاجة لـ Windows إطلاقًا: لا يوجد أي بناء، فقط تجهيز ملفات جاهزة
+
+    steps:
+      - name: Checkout repository (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+
+      - name: Determine release tag and version number
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          if (-not $tag) { $tag = "${{ github.event.inputs.tag }}" }
+          if (-not $tag) { throw "No tag available (neither release event nor manual input provided one)." }
+
+          $version = $tag
+          if ($version.StartsWith("v")) { $version = $version.Substring(1) }
+
+          Write-Host "Tag: $tag"
+          Write-Host "Version: $version"
+          "tag=$tag"         >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Fail safely if the distribution folders are missing
+        shell: pwsh
+        run: |
+          # يفشل السير بوضوح فورًا لو نُسي نسخ ناتج publish-portable.bat إلى هذا المستودع قبل الإصدار،
+          # بدل المتابعة بصمت وإنتاج حزم فارغة/تالفة.
+          if (-not (Test-Path "Runtime")) {
+            throw "Runtime folder not found. Did you copy the published output into this repo before creating the release?"
+          }
+          if (-not (Test-Path "Fattura.exe")) {
+            throw "Fattura.exe launcher not found at repo root."
+          }
+          if (-not (Test-Path "Runtime/config.json")) {
+            throw "Runtime/config.json not found."
+          }
+          $fileCount = (Get-ChildItem -Path "Runtime" -Recurse -File | Where-Object {
+            $_.FullName -notmatch '[\\/]AppData[\\/]'
+          }).Count
+          if ($fileCount -lt 10) {
+            throw "Runtime only contains $fileCount file(s) - this doesn't look like a real published build. Aborting."
+          }
+          Write-Host "Distribution folder looks valid ($fileCount files)."
+
+      - name: Verify CurrentVersion in config.json matches the release tag
+        shell: pwsh
+        run: |
+          $configPath = "Runtime/config.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $expected = "${{ steps.version.outputs.version }}"
+          if ($config.CurrentVersion -ne $expected) {
+            Write-Host "::warning::config.json CurrentVersion is '$($config.CurrentVersion)' but the release tag implies '$expected'. Overriding it to '$expected' for the generated manifest/packages so the shipped update reports the correct version. Fix this in your Visual Studio project/publish step for next time."
+            $config.CurrentVersion = $expected
+            $config | ConvertTo-Json | Set-Content $configPath -Encoding UTF8
+          } else {
+            Write-Host "config.json CurrentVersion matches the release tag ($expected). OK."
+          }
+
+      - name: Find previous release tag
+        id: prevtag
+        shell: pwsh
+        run: |
+          $tags = git tag --sort=-creatordate | Where-Object { $_ -ne "${{ steps.version.outputs.tag }}" }
+          $previousTag = if ($tags) { $tags[0] } else { "" }
+          Write-Host "Previous tag: $(if ($previousTag) { $previousTag } else { '(none - first release)' })"
+          "tag=$previousTag" >> $env:GITHUB_OUTPUT
+
+      - name: Generate manifest.json (SHA256 + size for every file)
+        shell: pwsh
+        run: |
+          ./scripts/generate-manifest.ps1 `
+            -PublishFolder "Runtime" `
+            -OutputPath "manifest.json" `
+            -Version "${{ steps.version.outputs.version }}"
+
+      - name: Download previous release's manifest.json (if any) for diffing
+        id: prevmanifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $prevTag = "${{ steps.prevtag.outputs.tag }}"
+          if (-not $prevTag) {
+            Write-Host "No previous release; this is the first one. patch.zip will equal full.zip."
+            "path=" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          try {
+            gh release download $prevTag --pattern "manifest.json" --output "previous-manifest.json" --repo "${{ github.repository }}"
+            Write-Host "Downloaded previous manifest from release $prevTag"
+            "path=previous-manifest.json" >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Host "Could not download previous manifest (release $prevTag may predate the update system, or its manifest.json asset is missing). Falling back to a full patch."
+            "path=" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Build patch.zip and full.zip (diffed against previous manifest)
+        shell: pwsh
+        run: |
+          $prevManifestArg = "${{ steps.prevmanifest.outputs.path }}"
+          ./scripts/build-packages.ps1 `
+            -PublishFolder "Runtime" `
+            -CurrentManifestPath "manifest.json" `
+            -PreviousManifestPath $prevManifestArg `
+            -OutputFolder "release-assets"
+
+      - name: Generate changelog from git commits in this distribution repo
+        shell: pwsh
+        run: |
+          ./scripts/generate-changelog.ps1 `
+            -PreviousTag "${{ steps.prevtag.outputs.tag }}" `
+            -CurrentTag "${{ steps.version.outputs.tag }}" `
+            -OutputPath "release-assets/CHANGELOG.md"
+
+      - name: Build full portable folder zip (launcher + Runtime, for fresh installs)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "portable-staging/InvoiceApp" | Out-Null
+          Copy-Item "Fattura.exe" "portable-staging/InvoiceApp/Fattura.exe" -Force
+          Copy-Item "Runtime" "portable-staging/InvoiceApp/Runtime" -Recurse -Force
+          # لا نضمّن بيانات المستخدم (فواتير/نسخ احتياطية) في حزمة "تنزيل جديد من الصفر"
+          $appData = "portable-staging/InvoiceApp/Runtime/AppData"
+          if (Test-Path $appData) { Remove-Item $appData -Recurse -Force }
+          Compress-Archive -Path "portable-staging/InvoiceApp/*" -DestinationPath "release-assets/InvoiceApp-Portable.zip" -CompressionLevel Optimal
+
+      - name: Verify all expected assets were produced before uploading
+        shell: pwsh
+        run: |
+          $required = @("full.zip", "patch.zip", "manifest.json", "CHANGELOG.md", "InvoiceApp-Portable.zip")
+          foreach ($f in $required) {
+            $p = Join-Path "release-assets" $f
+            if (-not (Test-Path $p)) { throw "Expected asset '$f' was not produced. Aborting before upload." }
+            if ((Get-Item $p).Length -eq 0) { throw "Asset '$f' is empty (0 bytes). Aborting before upload." }
+          }
+          Write-Host "All required assets present and non-empty."
+
+      - name: Upload all assets to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release upload "${{ steps.version.outputs.tag }}" `
+            "release-assets/full.zip" `
+            "release-assets/patch.zip" `
+            "release-assets/manifest.json" `
+            "release-assets/CHANGELOG.md" `
+            "release-assets/InvoiceApp-Portable.zip" `
+            --repo "${{ github.repository }}" `
+            --clobber
+
+      - name: Verify assets are actually attached to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $assets = gh release view "${{ steps.version.outputs.tag }}" --repo "${{ github.repository }}" --json assets | ConvertFrom-Json
+          $names = $assets.assets.name
+          $required = @("full.zip", "patch.zip", "manifest.json", "CHANGELOG.md", "InvoiceApp-Portable.zip")
+          foreach ($f in $required) {
+            if ($names -notcontains $f) { throw "Upload verification failed: '$f' is missing from the release assets." }
+          }
+          Write-Host "Upload verified: all $($required.Count) assets are attached to $( '${{ steps.version.outputs.tag }}' )."
+
+      - name: Update release notes with generated changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release edit "${{ steps.version.outputs.tag }}" `
+            --notes-file "release-assets/CHANGELOG.md" `
+            --repo "${{ github.repository }}"
